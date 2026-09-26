@@ -1,0 +1,111 @@
+// Measures for the Olist e-commerce report.
+// Put them in a dedicated table: Home > Enter data > name it "_Measures" > Load,
+// then New measure for each block below (paste everything after "=").
+//
+// The definitions match olistpipe/powerbi.py measures() exactly, so you can check a
+// card in Power BI against `python -c "..."` output (see BUILD_GUIDE.md, step 9).
+// is_sale, is_delivered, is_late are 0/1 integers in the CSV exports.
+//   sale      = order_status not in (canceled, unavailable)
+//   GMV       = sum of item price + freight (order_value) over sale orders
+
+// ---------------------------------------------------------------- sales
+GMV =
+SUMX (
+    FILTER ( fact_orders, fact_orders[is_sale] = 1 ),
+    fact_orders[order_value]
+)
+
+Orders =
+CALCULATE (
+    DISTINCTCOUNT ( fact_orders[order_id] ),
+    fact_orders[is_sale] = 1
+)
+
+AOV =
+DIVIDE ( [GMV], [Orders] )
+
+Customers =
+CALCULATE (
+    DISTINCTCOUNT ( fact_orders[customer_unique_id] ),
+    fact_orders[is_sale] = 1
+)
+
+// Customers with 2+ sale orders divided by customers with 1+ sale order.
+// customer_unique_id is the person; customer_id in raw Olist is per order.
+Repeat Rate % =
+VAR PerCustomer =
+    ADDCOLUMNS (
+        CALCULATETABLE (
+            VALUES ( fact_orders[customer_unique_id] ),
+            fact_orders[is_sale] = 1
+        ),
+        "@orders",
+            CALCULATE (
+                DISTINCTCOUNT ( fact_orders[order_id] ),
+                fact_orders[is_sale] = 1
+            )
+    )
+VAR Buyers = COUNTROWS ( PerCustomer )
+VAR Repeaters = COUNTROWS ( FILTER ( PerCustomer, [@orders] >= 2 ) )
+RETURN
+    DIVIDE ( Repeaters, Buyers )
+
+// Month over month. Needs dim_date marked as the date table and related to
+// fact_orders[purchase_date_key]. Put dim_date[year_month] or dim_date[date] on the axis.
+GMV Previous Month =
+CALCULATE ( [GMV], DATEADD ( dim_date[date], -1, MONTH ) )
+
+GMV MoM % =
+DIVIDE ( [GMV] - [GMV Previous Month], [GMV Previous Month] )
+
+// ---------------------------------------------------------------- delivery
+Delivered Orders =
+CALCULATE ( COUNTROWS ( fact_orders ), fact_orders[is_delivered] = 1 )
+
+Late Orders =
+CALCULATE (
+    COUNTROWS ( fact_orders ),
+    fact_orders[is_delivered] = 1,
+    fact_orders[is_late] = 1
+)
+
+// Late = delivered on a later calendar day than the estimated delivery date.
+Late % =
+DIVIDE ( [Late Orders], [Delivered Orders] )
+
+On-time Delivery % =
+1 - [Late %]
+
+Avg Delivery Days =
+CALCULATE ( AVERAGE ( fact_orders[delivery_days] ), fact_orders[is_delivered] = 1 )
+
+// Only late orders: how late were they, on average?
+Avg Days Late When Late =
+CALCULATE (
+    AVERAGE ( fact_orders[delay_days] ),
+    fact_orders[is_delivered] = 1,
+    fact_orders[is_late] = 1
+)
+
+// ---------------------------------------------------------------- satisfaction
+Avg Review Score =
+AVERAGE ( fact_orders[review_score] )
+
+// ---------------------------------------------------------------- anomalies
+// For the daily revenue line: shows a value only on flagged days, so it can be drawn
+// as orange markers on top of the revenue line.
+Anomaly Revenue =
+CALCULATE (
+    SUM ( daily_revenue_anomaly[revenue] ),
+    daily_revenue_anomaly[is_anomaly] = 1
+)
+
+// ---------------------------------------------------------------- RFM
+Segment Customers =
+DISTINCTCOUNT ( customer_rfm[customer_unique_id] )
+
+Segment Revenue Share % =
+DIVIDE (
+    SUM ( customer_rfm[monetary] ),
+    CALCULATE ( SUM ( customer_rfm[monetary] ), ALL ( customer_rfm[segment] ) )
+)

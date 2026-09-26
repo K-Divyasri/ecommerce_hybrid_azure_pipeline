@@ -1,0 +1,12 @@
+# Host-side (Windows) and CI requirements for the pipeline package and tests.
+# Spark is NOT installed on the host: it runs in Docker (see README).
+pandas>=2.0
+numpy>=1.24
+pyarrow>=14
+SQLAlchemy>=2.0,<2.1
+PyMySQL>=1.1
+requests>=2.31
+azure-storage-blob>=12.19
+azure-cosmos>=4.7
+matplotlib>=3.7
+pytest>=8

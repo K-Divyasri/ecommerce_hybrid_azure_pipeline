@@ -1,0 +1,212 @@
+# Hybrid on-prem / Azure e-commerce pipeline.
+#   docker compose up -d --build          core stack (MySQL, HDFS, Azurite, Cosmos emulator, Airflow)
+#   docker compose run --rm spark ...     one-off Spark job or pytest   (profile: tools)
+# Host ports are all 33xxx so this stack can run next to other projects.
+name: de33
+
+x-airflow-common: &airflow-common
+  image: de33-airflow:3.1.8
+  build: ./docker/airflow
+  env_file:
+    - path: .env
+      required: false
+  environment: &airflow-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__CORE__AUTH_MANAGER: airflow.api_fastapi.auth.managers.simple.simple_auth_manager.SimpleAuthManager
+    AIRFLOW__CORE__SIMPLE_AUTH_MANAGER_ALL_ADMINS: "True"
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ""
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/project/dags
+    AIRFLOW__CORE__EXECUTION_API_SERVER_URL: http://airflow-apiserver:8080/execution/
+    AIRFLOW__API_AUTH__JWT_SECRET: de33_local_only_jwt_secret
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    PYTHONPATH: /opt/project
+    IN_DOCKER: "1"
+    SPARK_DRIVER_MEMORY: 1g
+  volumes:
+    - ./:/opt/project
+    - airflow-logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-depends
+    postgres:
+      condition: service_healthy
+    mysql:
+      condition: service_healthy
+
+services:
+  # ---------------------------------------------------------------- live store (OLTP)
+  mysql:
+    image: mysql:8.4.6
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpass
+      MYSQL_DATABASE: olist
+      MYSQL_USER: olist
+      MYSQL_PASSWORD: olist
+    ports: ["33306:3306"]
+    volumes:
+      - mysql-data:/var/lib/mysql
+      - ./sql/mysql:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "127.0.0.1", "-uolist", "-polist"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ---------------------------------------------------------------- Hadoop HDFS (on-prem lake)
+  namenode:
+    image: apache/hadoop:3.4.1
+    hostname: namenode
+    user: root
+    command: ["hdfs", "namenode"]
+    env_file: hadoop.env
+    environment:
+      ENSURE_NAMENODE_DIR: /hadoop/dfs/name
+    ports: ["33870:9870"]
+    volumes: ["namenode-data:/hadoop/dfs"]   # name dir is a SUBfolder so the image can format it on first start
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9870/webhdfs/v1/?op=GETFILESTATUS"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  datanode:
+    image: apache/hadoop:3.4.1
+    hostname: datanode
+    user: root
+    command: ["hdfs", "datanode"]
+    env_file: hadoop.env
+    volumes: ["datanode-data:/hadoop/dfs"]
+    depends_on:
+      namenode:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:9864/"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 20s
+
+  # ---------------------------------------------------------------- Azure emulators
+  azurite:
+    image: mcr.microsoft.com/azure-storage/azurite:3.35.0
+    command: ["azurite-blob", "--blobHost", "0.0.0.0", "--blobPort", "10000",
+              "--location", "/data", "--loose", "--skipApiVersionCheck"]
+    ports: ["33000:10000"]
+    volumes: ["azurite-data:/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 10000 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  cosmos:
+    # the Linux "vnext" emulator only publishes date-stamped tags; this one is pinned
+    image: mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:vnext-EN20260907
+    environment:
+      PROTOCOL: http
+      ENABLE_EXPLORER: "true"
+      ENABLE_TELEMETRY: "false"
+      LOG_LEVEL: warn
+    ports: ["33081:8081", "33234:1234"]
+    volumes: ["cosmos-data:/data"]
+    healthcheck:
+      test: ["CMD", "curl", "-sf", "http://localhost:8080/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 18
+      start_period: 20s
+
+  # ---------------------------------------------------------------- Airflow 3 (LocalExecutor)
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    volumes: ["airflow-db:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/logs
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/logs
+        /entrypoint airflow version
+    environment:
+      <<: *airflow-env
+      _AIRFLOW_DB_MIGRATE: "true"
+    user: "0:0"
+
+  airflow-apiserver:
+    <<: *airflow-common
+    command: api-server
+    ports: ["33080:8080"]
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/api/v2/monitor/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    ports: ["33040:4040"]   # Spark UI while the spark_gold task is running
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8974/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+
+  airflow-dag-processor:
+    <<: *airflow-common
+    command: dag-processor
+    healthcheck:
+      test: ["CMD-SHELL", "airflow jobs check --job-type DagProcessorJob --hostname \"$${HOSTNAME}\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    depends_on:
+      <<: *airflow-depends
+      airflow-init:
+        condition: service_completed_successfully
+
+  # ---------------------------------------------------------------- Spark tools (on demand)
+  spark:
+    image: de33-spark:3.5.3
+    build: ./docker/spark
+    profiles: ["tools"]
+    environment:
+      IN_DOCKER: "1"
+    volumes: ["./:/opt/project"]
+    working_dir: /opt/project
+
+volumes:
+  mysql-data:
+  namenode-data:
+  datanode-data:
+  azurite-data:
+  cosmos-data:
+  airflow-db:
+  airflow-logs:

@@ -1,0 +1,28 @@
+# secrets and local config
+.env
+.env.bak
+*.pem
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+.benchmarks/
+.ipynb_checkpoints/
+
+# generated data (the committed sample lives in data/sample/)
+data/raw/
+data/local_lake/
+data/*.log
+out/
+spark-warehouse/
+metastore_db/
+derby.log
+*.parquet
+
+# the real Kaggle Olist CSVs are CC BY-NC-SA 4.0: never commit them
+olist_*_dataset.csv
+!data/sample/olist/*.csv
+product_category_name_translation.csv
+!data/sample/olist/product_category_name_translation.csv
